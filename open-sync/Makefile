@@ -1,4 +1,4 @@
-DEMON_BINARY_PATH= bin/daemon
+DAEMON_BINARY_PATH= bin/daemon
 PROTO_FILE = internal/protobuf/protocol.proto
 PROTO_GO = internal/protobuf/protocol.pb.go
 
