@@ -1,4 +1,4 @@
-const API_URL = "http://localhost:8080/upload";
+const API_URL = "http://localhost:8000/upload";
 
 import { Button } from "@/components/ui/button";
 import { useTheme } from "@/hooks/useTheme";
@@ -8,7 +8,7 @@ import { Input } from "./ui/input";
 
 export default function SendFile() {
   const [selectedFile, setSelectedFile] = useState<File | null>(null);
-  const [recipient, setRecipient] = useState<string>("");
+  const [receiverAddr, setReceiverAddr] = useState<string>("");
   const [error, setError] = useState<string | null>(null);
   const [isUploading, setIsUploading] = useState(false);
   const [hasUploaded, setHasUploaded] = useState(false);
@@ -23,14 +23,14 @@ export default function SendFile() {
       return;
     }
 
-    if (!recipient) {
-      setError("Please enter a recipient");
+    if (!receiverAddr) {
+      setError("Please enter a receiver address");
       return;
     }
 
     const formData = new FormData();
     formData.append("file", selectedFile);
-    formData.append("recipient", recipient);
+    formData.append("receiver_addr", receiverAddr);
 
     try {
       setIsUploading(true);
@@ -100,9 +100,9 @@ export default function SendFile() {
         </div>
         <div className="border-border m-3 border-l-2 p-4">
           <Input
-            value={recipient}
-            onChange={(e) => setRecipient(e.target.value)}
-            placeholder="Recipient ID"
+            value={receiverAddr}
+            onChange={(e) => setReceiverAddr(e.target.value)}
+            placeholder="Receiver Address (e.g., 127.0.0.1:8081)"
           />
         </div>
         <div className="flex gap-1">
