@@ -1,0 +1,10 @@
+syntax = "proto3";
+
+package protocol;
+
+option go_package = "github.com/rudransh-shrivastava/open-sync/open-sync/internal/protocol";
+
+message FileMsg {
+  int32 seq_num = 1;
+  bytes data = 2;
+}
