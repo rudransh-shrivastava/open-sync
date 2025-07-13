@@ -16,17 +16,65 @@ import (
 )
 
 const chunkSize = 1024 // 1KB
+const transferTimeout = 5 * time.Second
+const senderTimeout = 10 * time.Second
 
 type fileTransfer struct {
 	file           *os.File
 	totalChunks    int64
 	receivedChunks map[int64]bool
 	lastPacketTime time.Time
+	remoteAddr     *net.UDPAddr
 }
 
 func udpListener(conn *net.UDPConn) {
 	transfers := make(map[string]*fileTransfer)
 	buffer := make([]byte, 65507) // Max UDP packet size
+
+	ticker := time.NewTicker(1 * time.Second)
+	defer ticker.Stop()
+
+	go func() {
+		for range ticker.C {
+			for key, transfer := range transfers {
+				if time.Since(transfer.lastPacketTime) > transferTimeout {
+					if int64(len(transfer.receivedChunks)) != transfer.totalChunks {
+						var missingChunks []int64
+						for i := int64(0); i < transfer.totalChunks; i++ {
+							if !transfer.receivedChunks[i] {
+								missingChunks = append(missingChunks, i)
+							}
+						}
+						if len(missingChunks) > 0 {
+							log.Printf("Requesting missing chunks for %s from %s", transfer.file.Name(), transfer.remoteAddr)
+							requestMissing := &pb.Packet{
+								Payload: &pb.Packet_RequestMissing{
+									RequestMissing: &pb.RequestMissing{
+										SequenceNumbers: missingChunks,
+									},
+								},
+							}
+							data, err := proto.Marshal(requestMissing)
+							if err != nil {
+								log.Printf("Failed to marshal missing chunks request: %v", err)
+								continue
+							}
+							_, err = conn.WriteToUDP(data, transfer.remoteAddr)
+							if err != nil {
+								log.Printf("Failed to send missing chunks request: %v", err)
+							}
+							transfer.lastPacketTime = time.Now() // Reset timer
+						}
+					} else {
+						// Transfer complete, but ACK might have been lost. Clean up.
+						log.Printf("Transfer for %s from %s timed out after completion.", transfer.file.Name(), transfer.remoteAddr)
+						transfer.file.Close()
+						delete(transfers, key)
+					}
+				}
+			}
+		}
+	}()
 
 	for {
 		n, remoteAddr, err := conn.ReadFromUDP(buffer)
@@ -63,6 +111,7 @@ func udpListener(conn *net.UDPConn) {
 				totalChunks:    md.TotalChunks,
 				receivedChunks: make(map[int64]bool),
 				lastPacketTime: time.Now(),
+				remoteAddr:     remoteAddr,
 			}
 
 		case *pb.Packet_Chunk:
@@ -85,6 +134,22 @@ func udpListener(conn *net.UDPConn) {
 
 			if int64(len(transfer.receivedChunks)) == transfer.totalChunks {
 				log.Printf("Finished receiving %s from %s", transfer.file.Name(), remoteAddr)
+				ack := &pb.Packet{
+					Payload: &pb.Packet_Ack{
+						Ack: &pb.Ack{
+							SequenceNumber: -1, // -1 indicates final ACK
+						},
+					},
+				}
+				data, err := proto.Marshal(ack)
+				if err != nil {
+					log.Printf("Failed to marshal final ACK: %v", err)
+				} else {
+					_, err = conn.WriteToUDP(data, remoteAddr)
+					if err != nil {
+						log.Printf("Failed to send final ACK: %v", err)
+					}
+				}
 				transfer.file.Close()
 				delete(transfers, remoteAddr.String())
 			}
@@ -127,6 +192,60 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	defer conn.Close()
+
+	ackChan := make(chan bool)
+
+	// Listen for missing chunk requests and final ACK
+	go func() {
+		buffer := make([]byte, 65507)
+		for {
+			n, _, err := conn.ReadFrom(buffer)
+			if err != nil {
+				// This error is expected when the connection is closed
+				return
+			}
+
+			var packet pb.Packet
+			if err := proto.Unmarshal(buffer[:n], &packet); err != nil {
+				log.Printf("Failed to unmarshal packet: %v", err)
+				continue
+			}
+
+			switch p := packet.Payload.(type) {
+			case *pb.Packet_RequestMissing:
+				log.Printf("Received request for missing chunks")
+				for _, seq := range p.RequestMissing.SequenceNumbers {
+					start := seq * chunkSize
+					end := start + chunkSize
+					if end > int64(len(fileBytes)) {
+						end = int64(len(fileBytes))
+					}
+
+					chunk := &pb.Packet{
+						Payload: &pb.Packet_Chunk{
+							Chunk: &pb.Chunk{
+								SequenceNumber: seq,
+								Data:           fileBytes[start:end],
+							},
+						},
+					}
+					chunkData, err := proto.Marshal(chunk)
+					if err != nil {
+						log.Printf("Failed to marshal chunk %d: %v", seq, err)
+						continue
+					}
+					_, err = conn.Write(chunkData)
+					if err != nil {
+						log.Printf("Failed to re-send chunk %d: %v", seq, err)
+					}
+				}
+			case *pb.Packet_Ack:
+				if p.Ack.SequenceNumber == -1 {
+					ackChan <- true
+				}
+			}
+		}
+	}()
 
 	fileSize := int64(len(fileBytes))
 	totalChunks := int64(math.Ceil(float64(fileSize) / float64(chunkSize)))
@@ -177,8 +296,13 @@ func uploadHandler(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
-	w.WriteHeader(http.StatusAccepted)
-	w.Write([]byte(`{"status": "transfer initiated"}`))
+	select {
+	case <-ackChan:
+		w.WriteHeader(http.StatusOK)
+		w.Write([]byte(`{"status": "transfer complete"}`))
+	case <-time.After(senderTimeout):
+		http.Error(w, "Transfer failed: timed out waiting for ACK", http.StatusInternalServerError)
+	}
 }
 
 func main() {
